@@ -1,6 +1,6 @@
 ---------------------------------------------------------------------------------
 --                           Juno First - AntMiner S9
---                                Code by Ace
+--                             Code by RodimusFVC
 --
 --                           Modified for AntMiner S9 
 --                               by pinballwiz 
