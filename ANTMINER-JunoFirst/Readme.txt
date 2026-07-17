@@ -1,5 +1,5 @@
 Juno First Arcade for the ANTMINER S9 ZYNQ-7010 FPGA Board. Pinballwiz 2026
-Code from Ace.
+Code from RodimusFVC.
 
 Notes:
 Setup for keyboard controls in Upright mode (5 = Coin)(1 = Start P1)(2 = Start P2)(Ctrl = Fire)(X = Warp)(Arrow Keys = Move Up or Down or Left or Right)
