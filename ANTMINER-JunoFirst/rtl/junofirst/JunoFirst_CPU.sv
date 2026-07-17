@@ -1,0 +1,694 @@
+//============================================================================
+//
+//  Tutankham main PCB model (based on Time Pilot core)
+//  Copyright (C) 2021 Ace, Artemio Urbina & RTLEngineering
+//
+//  Permission is hereby granted, free of charge, to any person obtaining a
+//  copy of this software and associated documentation files (the "Software"),
+//  to deal in the Software without restriction, including without limitation
+//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  and/or sell copies of the Software, and to permit persons to whom the
+//  Software is furnished to do so, subject to the following conditions:
+//
+//  The above copyright notice and this permission notice shall be included in
+//  all copies or substantial portions of the Software.
+//
+//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  DEALINGS IN THE SOFTWARE.
+//
+//============================================================================
+
+//Module declaration, I/O ports
+module JunoFirst_CPU
+(
+	input         reset,
+	input         clk_49m,          //Actual frequency: 49.152MHz
+	output  [4:0] red, green, blue, //15-bit RGB, 5 bits per color
+	output        video_hsync, video_vsync, video_csync, //CSync not needed for MISTer
+	output        video_hblank, video_vblank,
+	output        ce_pix,
+
+	input   [7:0] controls_dip,
+	input  [15:0] dip_sw,
+	output  [7:0] cpubrd_Dout,
+	output        cpubrd_A5, cpubrd_A6,
+	output        cs_sounddata, irq_trigger,
+	output        cs_dip2, cs_controls_dip1,
+
+	//Screen centering (alters HSync, VSync and VBlank timing in the Konami 082 to reposition the video output)
+	input   [3:0] h_center, v_center,
+
+	//ROM chip selects for main program ROMs (3x 8KB)
+//	input         prog_rom1_cs_i, prog_rom2_cs_i, prog_rom3_cs_i,
+	//ROM chip selects for banked code+graphics ROMs (6x 8KB)
+//	input         bank0_cs_i, bank1_cs_i, bank2_cs_i,
+//	input         bank3_cs_i, bank4_cs_i, bank5_cs_i,
+	//ROM chip selects for blitter sprite ROMs (3x 8KB)
+//	input         blit0_cs_i, blit1_cs_i, blit2_cs_i,
+//	input  [24:0] ioctl_addr,
+//	input   [7:0] ioctl_data,
+//	input         ioctl_wr,
+
+	input         pause,
+
+	// CRT Flip (status[22]): coordinate-level vertical flip. XOR'd into
+	// flip_y just before the eff_y read. Independent of HDMI Flip
+	// (status[11] -> screen_rotate framework path).
+	input         flip_vertical,
+	output     [15:0] AD
+
+//	input  [15:0] hs_address,
+//	input   [7:0] hs_data_in,
+//	output  [7:0] hs_data_out,
+//	input         hs_write
+);
+
+//------------------------------------------------------- Signal outputs -------------------------------------------------------//
+
+//Assign active high HBlank and VBlank outputs
+assign video_hblank = hblk;
+assign video_vblank = vblk;
+
+//Output pixel clock enable
+assign ce_pix = cen_6m;
+
+//Output select lines for player inputs and DIP switches to sound board
+assign cs_controls_dip1 = cs_in0 | cs_in1 | cs_in2 | cs_dsw1;
+assign cs_dip2 = cs_dsw2;
+
+//Output primary MC6809E address lines A5 and A6 to sound board
+// Juno First address map: input ports at 0x8020-0x802C, sound board mux uses A[6:5]
+assign cpubrd_A5 = cpu_A[2];
+assign cpubrd_A6 = cpu_A[3];
+
+// Latch CPU data when writing sound commands — the data bus changes
+// on the next cycle but sound board needs it held for cen_3m sampling.
+reg [7:0] sound_data_latch = 8'd0;
+always_ff @(posedge clk_49m) begin
+	if(!reset)
+		sound_data_latch <= 8'd0;
+	else if(cs_soundcmd)
+		sound_data_latch <= cpu_Dout;
+end
+assign cpubrd_Dout = sound_data_latch;
+
+// Latch sound command strobe — hold until sound board's cen_3m can sample it
+// The CPU write is brief; the sound board samples on cen_3m which is every 16 clocks.
+// We need to stretch the pulse so it's guaranteed to be seen.
+reg cs_sounddata_latch = 0;
+reg [3:0] snd_data_hold = 0;
+always_ff @(posedge clk_49m) begin
+    if(!reset) begin
+        cs_sounddata_latch <= 0;
+        snd_data_hold <= 0;
+    end
+    else begin
+        if(cs_soundcmd) begin
+            cs_sounddata_latch <= 1;
+            snd_data_hold <= 4'd15;  // Hold for 16 clocks (guarantees one cen_3m)
+        end
+        else if(snd_data_hold > 0)
+            snd_data_hold <= snd_data_hold - 4'd1;
+        else
+            cs_sounddata_latch <= 0;
+    end
+end
+assign cs_sounddata = cs_sounddata_latch;
+
+// Sound IRQ trigger — stretch pulse so sound board's cen_3m can catch it
+reg sound_irq = 0;
+reg [3:0] snd_irq_hold = 0;
+always_ff @(posedge clk_49m) begin
+    if(!reset) begin
+        sound_irq <= 0;
+        snd_irq_hold <= 0;
+    end
+    else begin
+        if(cs_soundon) begin
+            sound_irq <= 1;
+            snd_irq_hold <= 4'd15;
+        end
+        else if(snd_irq_hold > 0)
+            snd_irq_hold <= snd_irq_hold - 4'd1;
+        else
+            sound_irq <= 0;
+    end
+end
+assign irq_trigger = sound_irq;
+
+//------------------------------------------------------- Clock division -------------------------------------------------------//
+
+//Generate 6.144MHz and 3.072MHz clock enables
+reg [4:0] div = 5'd0;
+always_ff @(posedge clk_49m) begin
+	div <= div + 5'd1;
+end
+wire cen_6m = !div[2:0];
+wire cen_3m = !div[3:0];
+
+//MC6809E E and Q clock generation
+//Real hardware: 18.432MHz crystal / 12 = 1.536MHz E clock
+//FPGA: 49.152MHz / 32 = 1.536MHz (49.152 = 18.432 * 8/3)
+//E/Q transitions every 8 master clocks within 32-clock cycle
+reg cpu_E = 0;
+reg cpu_Q = 0;
+always_ff @(posedge clk_49m) begin
+	if(~pause) begin
+		case(div[4:0])
+			5'd0:  begin cpu_E <= 1; cpu_Q <= 0; end
+			5'd8:  begin cpu_E <= 1; cpu_Q <= 1; end
+			5'd16: begin cpu_E <= 0; cpu_Q <= 1; end
+			5'd24: begin cpu_E <= 0; cpu_Q <= 0; end
+			default: ;
+		endcase
+	end
+end
+
+// Generate falling-edge enables for KONAMI1/mc6809is core
+reg cpu_E_last = 0;
+reg cpu_Q_last = 0;
+wire fallE_en = cpu_E_last & ~cpu_E;  // One-cycle pulse on falling edge of E
+wire fallQ_en = cpu_Q_last & ~cpu_Q;  // One-cycle pulse on falling edge of Q
+always_ff @(posedge clk_49m) begin
+	cpu_E_last <= cpu_E;
+	cpu_Q_last <= cpu_Q;
+end
+
+//------------------------------------------------------------ CPUs ------------------------------------------------------------//
+
+//Primary CPU — KONAMI-1 (encrypted MC6809E)
+wire [15:0] cpu_A;
+wire [7:0] cpu_Dout;
+wire cpu_RnW;
+
+assign AD = cpu_A;
+
+KONAMI1 E3
+(
+	.CLK(clk_49m),
+	.fallE_en(fallE_en),
+	.fallQ_en(fallQ_en),
+	.D(cpu_Din),         // Raw bus data KONAMI1 handles decryption internally
+	.DOut(cpu_Dout),
+	.ADDR(cpu_A),
+	.RnW(cpu_RnW),
+	.nIRQ(n_irq),
+	.nFIRQ(1'b1),
+	.nNMI(1'b1),
+	.BS(),
+	.BA(),
+	.AVMA(),
+	.BUSY(),
+	.LIC(),
+	.nHALT(~blit_active),
+	.nRESET(reset)
+);
+
+//------------------------------------------------------ Address decoding ------------------------------------------------------//
+
+//Juno First memory map
+wire n_cs_videoram = ~(cpu_A[15] == 1'b0);               // 0x0000-0x7FFF (32KB video RAM)
+//Juno First work RAM: 0x8100-0x8FFF (3840 bytes, ~4KB)
+//This is larger than Tutankham's 0x8800-0x8FFF (2KB)
+wire n_cs_workram  = ~(cpu_A[15:8] >= 8'h81 && cpu_A[15:8] <= 8'h8F);  // 0x8100-0x8FFF
+wire n_cs_workram2 = 1'b1;  // Disabled — replaced by larger workram above
+wire n_cs_bankrom  = ~(cpu_A[15:12] == 4'b1001);          // 0x9000-0x9FFF (4KB banked ROM window)
+wire n_cs_mainrom  = ~(cpu_A[15:13] == 3'b101 |
+                       cpu_A[15:13] == 3'b110 |
+                       cpu_A[15:13] == 3'b111);            // 0xA000-0xFFFF (24KB main ROM)
+
+//Juno First I/O decoding (memory-mapped in 0x8000-0x80FF region)
+//Reference: MAME junofrst.cpp main_map and Juno First schematics
+wire cs_palette    = (cpu_A[15:4] == 12'h800);              // 0x8000-0x800F (palette RAM, same as TUT)
+wire cs_dsw2       = (cpu_A[15:0] == 16'h8010);             // 0x8010 (DIP SW2)
+wire cs_watchdog   = (cpu_A[15:0] == 16'h801C);             // 0x801C (watchdog reset)
+wire cs_in0        = (cpu_A[15:0] == 16'h8020);             // 0x8020 (SYSTEM: coins, start)
+wire cs_in1        = (cpu_A[15:0] == 16'h8024);             // 0x8024 (P1 controls)
+wire cs_in2        = (cpu_A[15:0] == 16'h8028);             // 0x8028 (P2 controls)
+wire cs_dsw1       = (cpu_A[15:0] == 16'h802C);             // 0x802C (DIP SW1)
+wire cs_mainlatch  = (cpu_A[15:3] == 13'h1006) & ~cpu_RnW;  // 0x8030-0x8037 (main latch, active low bit 0)
+wire cs_soundon    = (cpu_A[15:0] == 16'h8040) & ~cpu_RnW;  // 0x8040 (sound IRQ trigger)
+wire cs_soundcmd   = (cpu_A[15:0] == 16'h8050) & ~cpu_RnW;  // 0x8050 (sound command data)
+wire cs_banksel_wr = (cpu_A[15:0] == 16'h8060) & ~cpu_RnW;  // 0x8060 (bank select)
+wire cs_blitter    = (cpu_A[15:2] == 14'h201C) & ~cpu_RnW;  // 0x8070-0x8073 (blitter, active on write)
+
+//ROM bank select register (0x8060)
+reg [3:0] rom_bank = 4'd0;
+always_ff @(posedge clk_49m) begin
+	if(!reset)
+		rom_bank <= 4'd0;
+	else if(cen_3m && cs_banksel_wr)
+		rom_bank <= cpu_Dout[3:0];
+end
+
+//----------------------------------------------------------- Blitter ----------------------------------------------------------//
+
+// Juno First hardware blitter — 16x16 nibble-addressed sprite copy/clear
+// Reference: MAME junofrst.cpp blitter_w()
+//
+// CPU writes to 0x8070-0x8073:
+//   [0] = dest address high byte (nibble address)
+//   [1] = dest address low byte
+//   [2] = source address high byte (nibble address into blitrom)
+//   [3] = source address low byte — write here triggers blit
+//         bit 0 = copy flag (1=draw, 0=erase)
+//         bits 1:0 masked off for source address
+//
+// Blit operation: 16 rows x 16 columns of nibbles
+// After each row of 16 nibbles, dest advances by 256 (16 + 240 skip)
+
+// Blitter data registers (directly written by CPU)
+reg [7:0] blitterdata [0:3];
+initial begin : blit_init
+	integer i;
+	for (i = 0; i < 4; i = i + 1)
+		blitterdata[i] = 8'd0;
+end
+
+// Blitter state machine
+reg blit_active = 0;
+reg [15:0] blit_src;
+reg [15:0] blit_dest;
+reg blit_copy;
+reg [3:0] blit_row;
+reg [3:0] blit_col;
+reg [1:0] blit_phase;  // 0=read ROM, 1=read VRAM, 2=write VRAM, 3=advance
+
+// Blitter ROM (6KB = 3x 8KB ROMs, addressed by nibble address >> 1)
+// Total blitrom space: 0x6000 bytes = 24576 bytes, needs 15-bit byte address
+wire [7:0] blit0_D, blit1_D, blit2_D;
+
+wire [14:0] blit_byte_addr = blit_src[15:1];
+wire [7:0] blitrom_D = (blit_byte_addr[14:13] == 2'b00) ? blit0_D :
+                       (blit_byte_addr[14:13] == 2'b01) ? blit1_D :
+                       (blit_byte_addr[14:13] == 2'b10) ? blit2_D :
+                       8'h00;
+
+blit_rom0 blit_rom0 (.addr(blit_byte_addr[12:0]), .clk(clk_49m), .data(blit0_D));//,
+   //                 .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+    //                .CS_DL(blit0_cs_i), .WR(ioctl_wr));
+blit_rom1 blit_rom1 (.addr(blit_byte_addr[12:0]), .clk(clk_49m), .data(blit1_D));//,
+  //                  .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //                 .CS_DL(blit1_cs_i), .WR(ioctl_wr));
+blit_rom2 blit_rom2 (.addr(blit_byte_addr[12:0]), .clk(clk_49m), .data(blit2_D));//,
+  //                  .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //                 .CS_DL(blit2_cs_i), .WR(ioctl_wr));
+
+// Extract source nibble from blitrom byte
+wire [3:0] blit_src_nibble = blit_src[0] ? blitrom_D[3:0] : blitrom_D[7:4];
+
+// Blitter VRAM interface signals
+reg blit_vram_we = 0;
+reg [14:0] blit_vram_addr;
+reg [7:0] blit_vram_wdata;
+wire [7:0] blit_vram_rdata;  // This will come from VRAM port A when blitter is active
+
+// CPU write to blitter registers
+always_ff @(posedge clk_49m) begin
+	if(!reset) begin
+		blitterdata[0] <= 8'd0;
+		blitterdata[1] <= 8'd0;
+		blitterdata[2] <= 8'd0;
+		blitterdata[3] <= 8'd0;
+	end
+	else if(cs_blitter)
+		blitterdata[cpu_A[1:0]] <= cpu_Dout;
+end
+
+// Blitter trigger and state machine
+// Triggered when CPU writes to 0x8073 (offset 3)
+// Runs at clk_49m, completes 16x16 = 256 nibble operations
+// Each nibble takes 4 phases (read ROM already pipelined, read VRAM, modify, write VRAM)
+always_ff @(posedge clk_49m) begin
+	if(!reset) begin
+		blit_active <= 0;
+		blit_row <= 0;
+		blit_col <= 0;
+		blit_phase <= 0;
+		blit_vram_we <= 0;
+	end
+	else begin
+		blit_vram_we <= 0;  // Default: no write
+
+		if(!blit_active) begin
+			// Watch for trigger: CPU writing to offset 3
+			if(cs_blitter && cpu_A[1:0] == 2'b11) begin
+				blit_active <= 1;
+				blit_src <= {blitterdata[2], cpu_Dout} & 16'hFFFC;  // Use cpu_Dout for byte 3 (being written now)
+				blit_dest <= {blitterdata[0], blitterdata[1]};
+				blit_copy <= cpu_Dout[0];  // Bit 0 of source low byte
+				blit_row <= 0;
+				blit_col <= 0;
+				blit_phase <= 0;
+			end
+		end
+		else begin
+			// Blitter running — 4 phases per nibble
+			case(blit_phase)
+				2'd0: begin
+					// Phase 0: Set up blitrom read address (already wired combinationally)
+					// Set up VRAM read address for the destination byte
+					blit_vram_addr <= blit_dest[15:1];
+					blit_phase <= 2'd1;
+				end
+				2'd1: begin
+					// Phase 1: VRAM read data available, ROM read data available
+					// Compute the write data
+					blit_phase <= 2'd2;
+				end
+				2'd2: begin
+					// Phase 2: Perform write if source nibble is non-zero
+					if(blit_src_nibble != 4'd0) begin
+						blit_vram_we <= 1;
+						if(blit_dest[0])
+							blit_vram_wdata <= {blit_copy ? blit_src_nibble : 4'd0, blit_vram_rdata[3:0]};
+						else
+							blit_vram_wdata <= {blit_vram_rdata[7:4], blit_copy ? blit_src_nibble : 4'd0};
+					end
+					blit_phase <= 2'd3;
+				end
+				2'd3: begin
+					// Phase 3: Advance to next nibble
+					blit_src <= blit_src + 16'd1;
+					blit_dest <= blit_dest + 16'd1;
+					blit_phase <= 0;
+
+					if(blit_col == 4'd15) begin
+						blit_col <= 0;
+						blit_dest <= blit_dest + 16'd241;  // +1 (current) +240 (skip) = 241
+						if(blit_row == 4'd15) begin
+							blit_active <= 0;  // Done
+						end
+						else begin
+							blit_row <= blit_row + 4'd1;
+						end
+					end
+					else begin
+						blit_col <= blit_col + 4'd1;
+					end
+				end
+			endcase
+		end
+	end
+end
+
+//------------------------------------------------------ CPU data input mux ---------------------------------------------------//
+
+// Controls and DIP switch data comes from the sound board via controls_dip input.
+// The sound board muxes the correct data based on cs_controls_dip1, cs_dip2,
+// cpubrd_A5, and cpubrd_A6 signals.
+
+// I/O registers must be checked first (they're in the 0x8000-0x87FF range)
+// Controls/DIP data comes from the sound board via controls_dip
+wire [7:0] cpu_Din_raw = cs_palette                              ? palette_D :
+                         cs_watchdog                             ? 8'hFF :
+                         (cs_dsw2 | cs_in0 | cs_in1 | cs_in2 | cs_dsw1) ? controls_dip :
+                         ~n_cs_workram                           ? workram_D :
+                         ~n_cs_bankrom                           ? bank_rom_D :
+                         ~n_cs_mainrom                           ? mainrom_D :
+                         ~n_cs_videoram                          ? videoram_D :
+                         8'hFF;
+
+wire [7:0] cpu_Din = cpu_Din_raw;
+
+//------------------------------------------------------- Main program ROMs ----------------------------------------------------//
+// cpu rom
+//prog_rom prog_rom
+//(
+//	.addr(cpu_A[14:0]),
+//	.clk(clk_49m),
+//	.data(mainrom_D)
+//	);	
+
+//Main program ROMs (3x 8KB = 24KB at 0xA000-0xFFFF)
+//  prog_rom1 = jfa_b9.bin  -> CPU 0xA000-0xBFFF
+//  prog_rom2 = jfb_b10.bin -> CPU 0xC000-0xDFFF
+//  prog_rom3 = jfc_a10.bin -> CPU 0xE000-0xFFFF
+wire [7:0] prog_rom1_D, prog_rom2_D, prog_rom3_D;
+
+wire [7:0] mainrom_D = (cpu_A[15:13] == 3'b101) ? prog_rom1_D :  // 0xA000-0xBFFF
+                       (cpu_A[15:13] == 3'b110) ? prog_rom2_D :  // 0xC000-0xDFFF
+                       (cpu_A[15:13] == 3'b111) ? prog_rom3_D :  // 0xE000-0xFFFF
+                       8'hFF;
+
+prog_rom1 prog_rom1 (.addr(cpu_A[12:0]), .clk(clk_49m), .data(prog_rom1_D));//,
+ //                   .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+  //                  .CS_DL(prog_rom1_cs_i), .WR(ioctl_wr));
+prog_rom2 prog_rom2 (.addr(cpu_A[12:0]), .clk(clk_49m), .data(prog_rom2_D));//,
+  //                  .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+  //                  .CS_DL(prog_rom2_cs_i), .WR(ioctl_wr));
+prog_rom3 prog_rom3 (.addr(cpu_A[12:0]), .clk(clk_49m), .data(prog_rom3_D));//,
+   //                 .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //                 .CS_DL(prog_rom3_cs_i), .WR(ioctl_wr));
+
+//------------------------------------------------------ Banked graphics ROMs --------------------------------------------------//
+
+//Banked code+graphics ROMs (6x 8KB = 48KB, paged into 0x9000-0x9FFF in 4KB windows)
+//Each 8KB ROM provides two 4KB bank pages:
+//  bank0 (jfc1_a4) -> pages 0,1   bank1 (jfc2_a5) -> pages 2,3
+//  bank2 (jfc3_a6) -> pages 4,5   bank3 (jfc4_a7) -> pages 6,7
+//  bank4 (jfc5_a8) -> pages 8,9   bank5 (jfc6_a9) -> pages 10,11
+//
+//The bank select register picks one of 16 possible 4KB pages.
+//The 8KB ROM is addressed by {page_bit_0, cpu_A[11:0]} = 13 bits.
+wire [7:0] bank0_D, bank1_D, bank2_D, bank3_D, bank4_D, bank5_D;
+
+wire [2:0] rom_select = rom_bank[3:1];   // Which 8KB ROM (0-5)
+wire       page_half  = rom_bank[0];      // Upper or lower 4KB within the 8KB ROM
+
+wire [7:0] bank_rom_D = (rom_select == 3'd0) ? bank0_D :
+                        (rom_select == 3'd1) ? bank1_D :
+                        (rom_select == 3'd2) ? bank2_D :
+                        (rom_select == 3'd3) ? bank3_D :
+                        (rom_select == 3'd4) ? bank4_D :
+                        (rom_select == 3'd5) ? bank5_D :
+                        8'hFF;
+
+wire [12:0] bank_addr = {page_half, cpu_A[11:0]};
+
+bank0 bank0 (.addr(bank_addr), .clk(clk_49m), .data(bank0_D));//,
+   //             .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //             .CS_DL(bank0_cs_i), .WR(ioctl_wr));
+bank1 bank1 (.addr(bank_addr), .clk(clk_49m), .data(bank1_D));//,
+  //              .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+  //              .CS_DL(bank1_cs_i), .WR(ioctl_wr));
+bank2 bank2 (.addr(bank_addr), .clk(clk_49m), .data(bank2_D));//,
+  //              .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //             .CS_DL(bank2_cs_i), .WR(ioctl_wr));
+bank3 bank3 (.addr(bank_addr), .clk(clk_49m), .data(bank3_D));//,
+  //              .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //             .CS_DL(bank3_cs_i), .WR(ioctl_wr));
+bank4 bank4 (.addr(bank_addr), .clk(clk_49m), .data(bank4_D));//,
+   //             .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //             .CS_DL(bank4_cs_i), .WR(ioctl_wr));
+bank5 bank5 (.addr(bank_addr), .clk(clk_49m), .data(bank5_D));//,
+  //              .ADDR_DL(ioctl_addr), .CLK_DL(clk_49m), .DATA_IN(ioctl_data),
+   //             .CS_DL(bank5_cs_i), .WR(ioctl_wr));
+
+//------------------------------------------------------------ RAM ------------------------------------------------------------//
+
+//Work RAM (0x8100-0x8FFF, ~4KB) — Juno First has more work RAM than Tutankham
+wire [7:0] workram_D;
+
+gen_ram #(8,12) workram
+(
+	.clk(clk_49m),
+	.we(~n_cs_workram & ~cpu_RnW),
+	.addr(cpu_A[11:0]),
+	.d(cpu_Dout),
+	.q(workram_D)
+	);
+/*
+dpram #(12,8) workram
+(
+	.clock_a(clk_49m),
+	.wren_a(~n_cs_workram & ~cpu_RnW),
+	.address_a(cpu_A[11:0]),
+	.data_a(cpu_Dout),
+	.q_a(workram_D),
+
+	.clock_b(clk_49m),
+	.wren_b(1'b0),//hs_write),
+	.address_b(12'b0),//hs_address[11:0]),
+	.data_b(8'b0),//hs_data_in),
+	.q_b(8'b0)//hs_data_out)
+);
+*/
+
+// Palette register file (0x8000-0x800F, 16 entries × 8 bits)
+// Uses registers instead of SPRAM so video scanout can read simultaneously with CPU
+reg [7:0] palette_regs [0:15];
+initial begin
+	integer i;
+	for (i = 0; i < 16; i = i + 1)
+		palette_regs[i] = 8'd0;
+end
+always_ff @(posedge clk_49m) begin
+	if(cs_palette && ~cpu_RnW)
+		palette_regs[cpu_A[3:0]] <= cpu_Dout;
+end
+wire [7:0] palette_D = palette_regs[cpu_A[3:0]];  // CPU read-back path
+
+//Video RAM (0x0000-0x7FFF, 32KB) - dual port: A=CPU/blitter, B=video scanout
+wire [7:0] videoram_vout;
+// Apply flip to VRAM read coordinates (Juno First has no hardware scroll register)
+// CRT Flip (flip_vertical, status[22]) XORs into both flip_x and flip_y (180°
+// rotation) to match what the upstream CRT-user PR shipped. Independent of the
+// framework HDMI Flip path on status[11].
+wire [7:0] eff_x = pix_x      ^ {8{flip_x ^ flip_vertical}};
+wire [7:0] eff_y = v_cnt[7:0] ^ {8{flip_y ^ flip_vertical}};
+wire [14:0] vram_rd_addr = {eff_y, eff_x[7:1]};
+
+// VRAM port A is shared between CPU and blitter
+// When blitter is active, it owns port A for read-modify-write
+wire [14:0] vram_a_addr  = blit_active ? blit_vram_addr : cpu_A[14:0];
+wire [7:0]  vram_a_wdata = blit_active ? blit_vram_wdata : cpu_Dout;
+wire        vram_a_we    = blit_active ? blit_vram_we : (~n_cs_videoram & ~cpu_RnW);
+wire [7:0]  vram_a_rdata;
+
+assign videoram_D = vram_a_rdata;
+assign blit_vram_rdata = vram_a_rdata;
+
+dpram #(15,8) videoram
+(
+	.clock_a(clk_49m),
+	.address_a(vram_a_addr),
+	.data_a(vram_a_wdata),
+	.wren_a(vram_a_we),
+	.q_a(vram_a_rdata),
+
+	.clock_b(clk_49m),
+	.address_b(vram_rd_addr),
+	.q_b(videoram_vout)
+);
+
+//--------------------------------------------------------- Main latch ---------------------------------------------------------//
+
+reg irq_enable = 0;
+reg flip_x = 0;
+reg flip_y = 0;
+always_ff @(posedge clk_49m) begin
+	if(!reset) begin
+		irq_enable <= 0;
+		flip_x <= 0;
+		flip_y <= 0;
+	end
+	else if(cen_3m) begin
+		if(cs_mainlatch)
+			case(cpu_A[2:0])
+				3'b000: irq_enable <= cpu_Dout[0];   // LS259 Q0: IRQ enable
+				3'b001: ;  // Coin counter 2 (active but no FPGA effect)
+				3'b010: ;  // Coin counter 1 (active but no FPGA effect)
+				3'b011: ;  // Unused
+				3'b100: flip_x <= cpu_Dout[0];        // Flip screen X (LS259 Q4, was Q6 in TUT)
+				3'b101: flip_y <= cpu_Dout[0];        // Flip screen Y (LS259 Q5, was Q7 in TUT)
+				3'b110: ;  // Unused
+				3'b111: ;  // Unused
+			endcase
+	end
+end
+
+//Generate VBlank IRQ for MC6809E
+// MAME: IRQ fires every other vblank frame when irq_enable is set.
+//       IRQ is cleared when irq_enable is written to 0.
+// ALL n_irq logic is in this single always_ff to avoid multiple-driver errors.
+reg n_irq = 1;
+reg irq_toggle = 0;
+reg vblank_irq_en_last = 0;
+always_ff @(posedge clk_49m) begin
+	if(!reset) begin
+		n_irq <= 1;
+		irq_toggle <= 0;
+		vblank_irq_en_last <= 0;
+	end
+	else if(cen_6m) begin
+		vblank_irq_en_last <= vblank_irq_en;
+		// Clear IRQ when irq_enable is turned off (matches MAME irq_enable_w)
+		if(!irq_enable)
+			n_irq <= 1;
+		// Detect rising edge of vblank_irq_en pulse from k082
+		else if(vblank_irq_en && !vblank_irq_en_last) begin
+			irq_toggle <= ~irq_toggle;
+			if(!irq_toggle)  // Fire on every other vblank
+				n_irq <= 0;
+		end
+	end
+end
+
+//-------------------------------------------------------- Video timing --------------------------------------------------------//
+
+//Konami 082 custom chip - responsible for all video timings
+wire vblk, vblank_irq_en, h256;
+wire [8:0] h_cnt;
+wire [7:0] v_cnt;
+k082 F5
+(
+	.reset(1),
+	.clk(clk_49m),
+	.cen(cen_6m),
+	.h_center(h_center),
+	.v_center(v_center),
+	.n_vsync(video_vsync),
+	.sync(video_csync),
+	.n_hsync(video_hsync),
+	.vblk(vblk),
+	.vblk_irq_en(vblank_irq_en),
+	.h1(h_cnt[0]),
+	.h2(h_cnt[1]),
+	.h4(h_cnt[2]),
+	.h8(h_cnt[3]),
+	.h16(h_cnt[4]),
+	.h32(h_cnt[5]),
+	.h64(h_cnt[6]),
+	.h128(h_cnt[7]),
+	.n_h256(h_cnt[8]),
+	.h256(h256),
+	.v1(v_cnt[0]),
+	.v2(v_cnt[1]),
+	.v4(v_cnt[2]),
+	.v8(v_cnt[3]),
+	.v16(v_cnt[4]),
+	.v32(v_cnt[5]),
+	.v64(v_cnt[6]),
+	.v128(v_cnt[7])
+);
+
+
+//----------------------------------------------------- Final video output -----------------------------------------------------//
+
+//Generate HBlank (active high) while the horizontal counter is between 141 and 268
+wire hblk = (h_cnt > 140 && h_cnt < 269);
+
+// Generate a 0-255 pixel X counter synchronized to the visible window
+// Visible pixels: h_cnt 269-511 (243 px), then 128-140 (13 px) = 256 total
+// Use h_cnt offset so pixel 0 aligns with h_cnt=269
+// Visible pixels: h_cnt 269-511 (243 px), then 128-140 (13 px) = 256 total
+// Must produce continuous pix_x 0-255 across the wrap at h_cnt 511→128
+// h_cnt 269-511: h_cnt[8]=1 (for 269-511), pix_x = h_cnt - 269
+// h_cnt 128-140: h_cnt[8]=0, pix_x = h_cnt - 128 + 243 = h_cnt + 115
+wire [7:0] pix_x = h_cnt[8] ? (h_cnt[7:0] - 8'd13) : (h_cnt[7:0] + 8'd115);
+
+// Framebuffer pixel extraction: 4-bit packed pixels, 2 per byte
+wire [3:0] pixel_index = eff_x[0] ? videoram_vout[7:4] : videoram_vout[3:0];
+
+// Palette lookup — convert 4-bit pixel index to RGB via palette registers
+// Palette byte format (Galaxian/Konami standard): BBGGGRRR
+//   bits [2:0] = Red   (3 bits, through 1K/470/220 ohm resistors)
+//   bits [5:3] = Green (3 bits, through 1K/470/220 ohm resistors)
+//   bits [7:6] = Blue  (2 bits, through 470/220 ohm resistors)
+wire [7:0] pal_byte = palette_regs[pixel_index];
+
+// Expand to 5-bit per channel for MiSTer output
+// Blank output during HBlank and VBlank to prevent ghost pixels
+wire active_video = ~hblk & ~vblk;
+
+assign red   = active_video ? {pal_byte[2:0], pal_byte[2:1]}              : 5'd0;
+assign green = active_video ? {pal_byte[5:3], pal_byte[5:4]}              : 5'd0;
+assign blue  = active_video ? {pal_byte[7:6], pal_byte[7:6], pal_byte[7]} : 5'd0;
+
+endmodule

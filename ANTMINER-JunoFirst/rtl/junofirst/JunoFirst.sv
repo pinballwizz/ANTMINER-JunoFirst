@@ -1,0 +1,215 @@
+//============================================================================
+// 
+//  Juno First top-level module
+//  Copyright (C) 2021 Ace
+//
+//  Permission is hereby granted, free of charge, to any person obtaining a
+//  copy of this software and associated documentation files (the "Software"),
+//  to deal in the Software without restriction, including without limitation
+//  the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  and/or sell copies of the Software, and to permit persons to whom the 
+//  Software is furnished to do so, subject to the following conditions:
+//
+//  The above copyright notice and this permission notice shall be included in
+//  all copies or substantial portions of the Software.
+//
+//  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  DEALINGS IN THE SOFTWARE.
+//
+//============================================================================
+
+//Module declaration, I/O ports
+module JunoFirst
+(
+	input                reset,
+	input                clk_49m,                  //Actual frequency: 49.152MHz
+	input                clk_8m,                   //i8039 MCU: 8.000MHz exact from PLL
+	input          [1:0] coin,                     //0 = coin 1, 1 = coin 2
+	input          [1:0] start_buttons,            //0 = Player 1, 1 = Player 2
+	input          [3:0] p1_joystick, p2_joystick, //0 = up, 1 = down, 2 = left, 3 = right
+	input                p1_fire,
+	input                p2_fire,
+	input                p1_warp,
+	input                p2_warp,
+//	input                btn_service,
+//	input         [15:0] dip_sw,
+	output               video_hsync, video_vsync, //video_csync,
+	output               video_hblank, video_vblank,
+//	output               ce_pix,
+	output         [4:0] video_r, video_g, video_b,
+	output signed [15:0] sound,
+	output        [15:0] AD
+
+//	output         [7:0] debug_p1,
+	
+	//Screen centering (alters HSync, VSync and VBlank timing in the Konami 082 to reposition the video output)
+//	input          [3:0] h_center, v_center,
+	
+//	input         [24:0] ioctl_addr,
+//	input          [7:0] ioctl_data,
+//	input                ioctl_wr,
+//	input          [7:0] ioctl_index,
+	
+//	input                pause,
+
+	// FIX-2026-05-24: video PLL underclock signal passed through to SND
+	// for cen_1m79 frac_cen compensation. See JunoFirst_SND.sv for detail.
+//	input                underclock,
+
+	// CRT Flip override (status[22]). XOR'd into eff_y in JunoFirst_CPU.
+//	input                flip_vertical,
+
+//	input         [15:0] hs_address,
+//	input          [7:0] hs_data_in,
+//	output         [7:0] hs_data_out,
+//	input                hs_write
+);
+
+wire btn_service = 1'b1;
+wire [15:0] dip_sw;
+wire underclock = 1'b0;
+wire [3:0] h_center = 4'b0000;
+wire [3:0] v_center = 4'b0000;
+wire video_csync;
+wire pause = 1'b0;
+wire flip_vertical = 1'b0;
+wire [7:0] debug_p1;
+
+assign dip_sw[15:8]  = 8'b00000011;
+assign dip_sw [7:0]  = 8'b00001111;
+
+//Linking signals between PCBs
+wire A5, A6, irq_trigger, cs_sounddata, cs_controls_dip1, cs_dip2;
+wire [7:0] controls_dip, cpubrd_D;
+
+//Index-filtered ROM write signals
+//wire ioctl_wr_cpu = ioctl_wr && (ioctl_index == 8'd0); // Main CPU board (index 0)
+//wire ioctl_wr_snd = ioctl_wr && (ioctl_index == 8'd1); // Z80 sound ROM (index 1)
+//wire ioctl_wr_mcu = ioctl_wr && (ioctl_index == 8'd2); // i8039 MCU ROM (index 2)
+
+//ROM loader signals for MISTer (loads ROMs from SD card)
+//wire prog_rom1_cs_i, prog_rom2_cs_i, prog_rom3_cs_i;
+//wire bank0_cs_i, bank1_cs_i, bank2_cs_i, bank3_cs_i, bank4_cs_i, bank5_cs_i;
+//wire blit0_cs_i, blit1_cs_i, blit2_cs_i;
+
+// Sound Z80 ROM (index 1, 4KB at 0x0000-0x0FFF)
+//wire sndrom_cs_i = (ioctl_addr < 25'h1000);
+// i8039 MCU ROM (index 2, 4KB at 0x0000-0x0FFF)
+//wire mcurom_cs_i = (ioctl_addr < 25'h1000);
+/*
+//MiSTer data write selector
+selector DLSEL
+(
+	.ioctl_addr(ioctl_addr),
+	.prog_rom1_cs(prog_rom1_cs_i),
+	.prog_rom2_cs(prog_rom2_cs_i),
+	.prog_rom3_cs(prog_rom3_cs_i),
+	.bank0_cs(bank0_cs_i),
+	.bank1_cs(bank1_cs_i),
+	.bank2_cs(bank2_cs_i),
+	.bank3_cs(bank3_cs_i),
+	.bank4_cs(bank4_cs_i),
+	.bank5_cs(bank5_cs_i),
+	.blit0_cs(blit0_cs_i),
+	.blit1_cs(blit1_cs_i),
+	.blit2_cs(blit2_cs_i)
+);
+*/
+//Instantiate main PCB
+JunoFirst_CPU main_pcb
+(
+	.reset(reset),
+	.clk_49m(clk_49m),
+	.red(video_r),
+	.green(video_g),
+	.blue(video_b),
+	.video_hsync(video_hsync),
+	.video_vsync(video_vsync),
+	.video_csync(video_csync),
+	.video_hblank(video_hblank),
+	.video_vblank(video_vblank),
+	.ce_pix(ce_pix),
+	
+	.h_center(h_center),
+	.v_center(v_center),
+	
+	.controls_dip(controls_dip),
+	.dip_sw(dip_sw),
+	.cpubrd_Dout(cpubrd_D),
+	.cpubrd_A5(A5),
+	.cpubrd_A6(A6),
+	.cs_sounddata(cs_sounddata),
+	.irq_trigger(irq_trigger),
+	.cs_dip2(cs_dip2),
+	.cs_controls_dip1(cs_controls_dip1),
+/*	
+	.prog_rom1_cs_i(prog_rom1_cs_i),
+	.prog_rom2_cs_i(prog_rom2_cs_i),
+	.prog_rom3_cs_i(prog_rom3_cs_i),
+	.bank0_cs_i(bank0_cs_i),
+	.bank1_cs_i(bank1_cs_i),
+	.bank2_cs_i(bank2_cs_i),
+	.bank3_cs_i(bank3_cs_i),
+	.bank4_cs_i(bank4_cs_i),
+	.bank5_cs_i(bank5_cs_i),
+	.blit0_cs_i(blit0_cs_i),
+	.blit1_cs_i(blit1_cs_i),
+	.blit2_cs_i(blit2_cs_i),
+	.ioctl_addr(ioctl_addr),
+	.ioctl_wr(ioctl_wr_cpu),
+	.ioctl_data(ioctl_data),
+*/
+	.pause(pause),
+	.flip_vertical(flip_vertical),
+	.AD(AD)
+
+//	.hs_address(hs_address),
+//	.hs_data_out(hs_data_out),
+//	.hs_data_in(hs_data_in),
+//	.hs_write(hs_write)
+);
+
+//Instantiate sound PCB
+JunoFirst_SND sound_pcb
+(
+	.reset(reset),
+	.clk_49m(clk_49m),
+	.clk_8m(clk_8m),
+	.dip_sw(dip_sw),
+	.coin(coin),
+	.start_buttons(start_buttons),
+	.p1_joystick(p1_joystick),
+	.p2_joystick(p2_joystick),
+	.p1_fire(p1_fire),
+	.p2_fire(p2_fire),
+	.p1_warp(p1_warp),
+	.p2_warp(p2_warp),
+	.btn_service(btn_service),
+	.cpubrd_A5(A5),
+	.cpubrd_A6(A6),
+	.cs_controls_dip1(cs_controls_dip1),
+	.cs_dip2(cs_dip2),
+	.controls_dip(controls_dip),
+	.irq_trigger(irq_trigger),
+	.cs_sounddata(cs_sounddata),
+	.cpubrd_Din(cpubrd_D),
+	.sound(sound),
+	.debug_p1(debug_p1),
+	.pause(pause),
+	// FIX-2026-05-24: underclock compensation for sound dividers
+	.underclock(underclock)
+
+//	.sndrom_cs_i(sndrom_cs_i),
+//	.sndrom_wr(ioctl_wr_snd),
+//	.mcurom_cs_i(mcurom_cs_i),
+//	.mcurom_wr(ioctl_wr_mcu),
+//	.ioctl_addr(ioctl_addr),
+//	.ioctl_data(ioctl_data)
+);
+
+endmodule
